@@ -1,32 +1,36 @@
 import UIKit
 
-// MARK: - WebDAV Models
+// MARK: - File System Models
 
-struct WebDAVCredentials: Codable {
-    let url: String
-    let username: String
-    let password: String
-    let protocolType: String
-
-    enum CodingKeys: String, CodingKey {
-        case url
-        case username
-        case password
-        case protocolType = "protocol"
+struct FileItem {
+    let url: URL
+    let name: String
+    let isDirectory: Bool
+    let size: Int64
+    let modificationDate: Date?
+    
+    init(url: URL) {
+        self.url = url
+        self.name = url.lastPathComponent
+        
+        // Get file attributes
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            self.isDirectory = isDirectory.boolValue
+        } else {
+            self.isDirectory = false
+        }
+        
+        // Get file size and modification date
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            self.size = attributes[.size] as? Int64 ?? 0
+            self.modificationDate = attributes[.modificationDate] as? Date
+        } catch {
+            self.size = 0
+            self.modificationDate = nil
+        }
     }
-}
-
-struct WebDAVResponse: Codable {
-    let credentials: WebDAVCredentials
-    let instructions: [String]
-    let clients: WebDAVClients?
-}
-
-struct WebDAVClients: Codable {
-    let ios: [String]?
-    let macos: [String]?
-    let windows: [String]?
-    let android: [String]?
 }
 
 class TerminalViewController: UIViewController {
@@ -36,15 +40,18 @@ class TerminalViewController: UIViewController {
     private let commandInputView = CommandInputView()
     private let activityIndicator = UIActivityIndicatorView(style: .medium)
     private let toolbar = UIToolbar()
-    private let connectionStatusView = UIView()
+    private let fileSystemButton = UIButton(type: .system)
 
     // MARK: - Properties
 
     private let history = CommandHistory()
     private var isExecuting = false
     private let logger = Debug.shared
-    private var isWebSocketConnected = false
-    private var userPreferenceWebSockets = true
+    private let terminalService = LocalTerminalService.shared
+    private var currentSessionId: String?
+    private var currentWorkingDirectory: URL {
+        return terminalService.getCurrentWorkingDirectory()
+    }
 
     // MARK: - Lifecycle
 
@@ -55,79 +62,42 @@ class TerminalViewController: UIViewController {
         setupKeyboardNotifications()
         setupActions()
 
-        // Load user preferences
-        loadUserPreferences()
-
         // Load command history
         history.loadHistory()
+        
+        // Create a new terminal session
+        createTerminalSession()
 
-        // Check WebSocket connection status
-        updateConnectionStatus()
+        // Set title
+        title = "Terminal"
 
-        // Update title to reflect current connection mode
-        updateTitle()
-
-        // Set up periodic connection status check
-        setupConnectionStatusTimer()
-
-        // Welcome message with connection info
-        let connectionInfo = isWebSocketConnected ? "WebSocket Connected" : "HTTP Mode"
-        appendToTerminal("Terminal Ready [\(connectionInfo)]\n$ ", isInput: false)
+        // Welcome message
+        let deviceInfo = UIDevice.current.name
+        let iosVersion = UIDevice.current.systemVersion
+        appendToTerminal("On-Device Terminal\n", isInput: false)
+        appendToTerminal("Device: \(deviceInfo) (iOS \(iosVersion))\n", isInput: false)
+        appendToTerminal("Type 'help' for available commands\n", isInput: false)
+        appendToTerminal("$ ", isInput: false)
 
         logger.log(message: "Terminal view controller loaded", type: .info)
     }
-
-    private func loadUserPreferences() {
-        // Load WebSocket preference from UserDefaults
-        if UserDefaults.standard.object(forKey: "terminal_websocket_enabled") != nil {
-            userPreferenceWebSockets = UserDefaults.standard.bool(forKey: "terminal_websocket_enabled")
-        } else {
-            // Default to true if not set previously
-            userPreferenceWebSockets = true
-            UserDefaults.standard.set(true, forKey: "terminal_websocket_enabled")
-        }
-
-        logger.log(message: "Loaded WebSocket preference: \(userPreferenceWebSockets)", type: .debug)
-    }
-
-    private func saveUserPreferences() {
-        // Save WebSocket preference to UserDefaults
-        UserDefaults.standard.set(userPreferenceWebSockets, forKey: "terminal_websocket_enabled")
-    }
-
-    private func setupConnectionStatusTimer() {
-        // Update connection status every 3 seconds
-        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+    
+    /// Create a new terminal session
+    private func createTerminalSession() {
+        terminalService.createSession { [weak self] result in
             guard let self = self else { return }
-
-            let wasConnected = self.isWebSocketConnected
-            self.updateConnectionStatus()
-
-            // If connection status changed, inform the user
-            if wasConnected != self.isWebSocketConnected {
-                DispatchQueue.main.async {
-                    if self.isWebSocketConnected {
-                        self.appendToTerminal("\nWebSocket connection established\n$ ", isInput: false)
-                    } else if self.userPreferenceWebSockets {
-                        self.appendToTerminal("\nWebSocket disconnected, using HTTP fallback\n$ ", isInput: false)
-                    }
-
-                    // Update title to reflect current status
-                    self.updateTitle()
-                }
+            
+            switch result {
+            case .success(let sessionId):
+                self.currentSessionId = sessionId
+                self.logger.log(message: "Created terminal session: \(sessionId)", type: .info)
+                
+            case .failure(let error):
+                self.logger.log(message: "Failed to create terminal session: \(error.localizedDescription)", type: .error)
+                self.appendToTerminal("Error: Failed to initialize terminal session\n", isInput: false)
             }
         }
     }
-
-    private func updateTitle() {
-        // Update navigation title to include connection mode
-        if isWebSocketConnected {
-            title = "Terminal [WebSocket]"
-        } else if !userPreferenceWebSockets {
-            title = "Terminal [HTTP]"
-        } else {
-            title = "Terminal [HTTP - Reconnecting]"
-        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -193,10 +163,16 @@ class TerminalViewController: UIViewController {
         activityIndicator.hidesWhenStopped = true
         activityIndicator.color = .systemBlue
 
-        // Connection status indicator setup
-        connectionStatusView.layer.cornerRadius = 5
-        connectionStatusView.layer.masksToBounds = true
-        updateConnectionStatus()
+        // File system button setup
+        fileSystemButton.setImage(UIImage(systemName: "folder"), for: .normal)
+        fileSystemButton.addTarget(self, action: #selector(showFileSystem), for: .touchUpInside)
+        fileSystemButton.layer.cornerRadius = 20
+        fileSystemButton.backgroundColor = .systemBlue
+        fileSystemButton.tintColor = .white
+        fileSystemButton.layer.shadowColor = UIColor.black.cgColor
+        fileSystemButton.layer.shadowOffset = CGSize(width: 0, height: 2)
+        fileSystemButton.layer.shadowOpacity = 0.3
+        fileSystemButton.layer.shadowRadius = 3
 
         // Toolbar setup
         setupToolbar()
@@ -205,48 +181,16 @@ class TerminalViewController: UIViewController {
         view.addSubview(terminalOutputTextView)
         view.addSubview(commandInputView)
         view.addSubview(activityIndicator)
-        view.addSubview(connectionStatusView)
+        view.addSubview(fileSystemButton)
     }
-
-    private func updateConnectionStatus() {
-        // Check if WebSocket is connected, respecting user preference
-        isWebSocketConnected = userPreferenceWebSockets && TerminalService.shared.isWebSocketActive
-
-        // Update connection status indicator
-        if isWebSocketConnected {
-            connectionStatusView.backgroundColor = .systemGreen
-        } else if !userPreferenceWebSockets {
-            // Red when user has disabled WebSockets
-            connectionStatusView.backgroundColor = .systemRed
-        } else {
-            // Gray when WebSockets are enabled but not connected
-            connectionStatusView.backgroundColor = .systemGray
-        }
-
-        // Update toolbar buttons to reflect current status
-        updateToolbarButtons()
-    }
-
-    @objc private func toggleWebSocketMode() {
-        // Toggle user preference for WebSockets
-        userPreferenceWebSockets = !userPreferenceWebSockets
-
-        // Save the preference
-        saveUserPreferences()
-
-        // Update connection status
-        updateConnectionStatus()
-
-        // Update title to reflect new mode
-        updateTitle()
-
-        // Inform the user about the change
-        let message = userPreferenceWebSockets
-            ? "WebSocket mode enabled"
-            : "WebSocket mode disabled, using HTTP fallback"
-
-        logger.log(message: message, type: .info)
-        appendToTerminal("\n\(message)\n$ ", isInput: false)
+    
+    @objc private func showFileSystem() {
+        // Create and present file browser
+        let fileManager = FileManagerViewController(directory: currentWorkingDirectory)
+        fileManager.delegate = self
+        
+        let navController = UINavigationController(rootViewController: fileManager)
+        present(navController, animated: true)
     }
 
     private func setupToolbar() {
@@ -290,27 +234,24 @@ class TerminalViewController: UIViewController {
             action: #selector(sendCtrlC)
         )
         ctrlCButton.accessibilityLabel = "Interrupt Command"
-
-        // WebSocket toggle button
-        let wsImage =
-            UIImage(systemName: isWebSocketConnected ? "antenna.radiowaves.left.and.right" :
-                "antenna.radiowaves.left.and.right.slash")
-        let wsButton = UIBarButtonItem(
-            image: wsImage,
+        
+        // Help button
+        let helpButton = UIBarButtonItem(
+            image: UIImage(systemName: "questionmark.circle"),
             style: .plain,
             target: self,
-            action: #selector(toggleWebSocketMode)
+            action: #selector(showHelp)
         )
-        wsButton.accessibilityLabel = isWebSocketConnected ? "Disable WebSocket" : "Enable WebSocket"
+        helpButton.accessibilityLabel = "Terminal Help"
 
-        // NEW: Added View Files button
-        let viewFilesButton = UIBarButtonItem(
-            image: UIImage(systemName: "folder"),
+        // Current directory button
+        let pwdButton = UIBarButtonItem(
+            image: UIImage(systemName: "location"),
             style: .plain,
             target: self,
-            action: #selector(viewFiles)
+            action: #selector(showCurrentDirectory)
         )
-        viewFilesButton.accessibilityLabel = "View Files"
+        pwdButton.accessibilityLabel = "Show Current Directory"
 
         toolbar.items = [
             clearButton,
@@ -322,32 +263,55 @@ class TerminalViewController: UIViewController {
             flexSpace,
             ctrlCButton,
             flexSpace,
-            viewFilesButton,
+            pwdButton,
             flexSpace,
-            wsButton,
+            helpButton,
         ]
         toolbar.sizeToFit()
         commandInputView.inputAccessoryView = toolbar
     }
-
-    private func updateToolbarButtons() {
-        guard let items = toolbar.items else { return }
-
-        // Update WebSocket toggle button (last item)
-        if let wsButton = items.last {
-            wsButton
-                .image =
-                UIImage(systemName: isWebSocketConnected ? "antenna.radiowaves.left.and.right" :
-                    "antenna.radiowaves.left.and.right.slash")
-            wsButton.accessibilityLabel = isWebSocketConnected ? "Disable WebSocket" : "Enable WebSocket"
-        }
+    
+    @objc private func showHelp() {
+        let helpText = """
+        Available Commands:
+        
+        File System:
+        - ls: List directory contents
+        - cd <dir>: Change directory
+        - pwd: Print working directory
+        - mkdir <dir>: Create directory
+        - rm <file/dir>: Remove file or directory
+        - touch <file>: Create empty file
+        - cat <file>: Display file contents
+        
+        Terminal:
+        - clear: Clear terminal screen
+        - history: Show command history
+        - help: Show this help message
+        
+        System:
+        - uname: Print system information
+        - whoami: Print current user
+        - date: Show current date and time
+        - env: Show environment variables
+        
+        Press the folder button to browse files visually.
+        """
+        
+        appendToTerminal("\n\(helpText)\n\n$ ", isInput: false)
+        scrollToBottom()
+    }
+    
+    @objc private func showCurrentDirectory() {
+        appendToTerminal("\n\(currentWorkingDirectory.path)\n$ ", isInput: false)
+        scrollToBottom()
     }
 
     private func setupConstraints() {
         terminalOutputTextView.translatesAutoresizingMaskIntoConstraints = false
         commandInputView.translatesAutoresizingMaskIntoConstraints = false
         activityIndicator.translatesAutoresizingMaskIntoConstraints = false
-        connectionStatusView.translatesAutoresizingMaskIntoConstraints = false
+        fileSystemButton.translatesAutoresizingMaskIntoConstraints = false
 
         NSLayoutConstraint.activate([
             // Terminal output
@@ -366,11 +330,11 @@ class TerminalViewController: UIViewController {
             activityIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             activityIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor),
 
-            // Connection status indicator
-            connectionStatusView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            connectionStatusView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            connectionStatusView.widthAnchor.constraint(equalToConstant: 10),
-            connectionStatusView.heightAnchor.constraint(equalToConstant: 10),
+            // File system button
+            fileSystemButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            fileSystemButton.bottomAnchor.constraint(equalTo: commandInputView.topAnchor, constant: -20),
+            fileSystemButton.widthAnchor.constraint(equalToConstant: 40),
+            fileSystemButton.heightAnchor.constraint(equalToConstant: 40),
         ])
     }
 
@@ -403,70 +367,80 @@ class TerminalViewController: UIViewController {
             return
         }
 
+        // Add to history
         history.addCommand(command)
         appendToTerminal("\n", isInput: false)
+        
+        // Show activity indicator
         isExecuting = true
         activityIndicator.startAnimating()
 
-        // Use streaming if WebSocket is connected
-        if isWebSocketConnected {
-            // Create a stream handler to receive real-time updates
-            let streamHandler: (String) -> Void = { [weak self] outputChunk in
-                DispatchQueue.main.async {
-                    guard let self = self, self.isExecuting else { return }
-                    self.appendToTerminalStreaming(outputChunk)
-                }
+        // Handle special commands
+        if command.lowercased() == "clear" {
+            // Clear the terminal
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.terminalOutputTextView.text = ""
+                self.appendToTerminal("$ ", isInput: false)
+                self.activityIndicator.stopAnimating()
+                self.isExecuting = false
             }
-
-            logger.log(message: "Executing command with WebSocket streaming: \(command)", type: .info)
-
-            // Execute with streaming support
-            TerminalService.shared.executeCommand(command, outputHandler: streamHandler) { [weak self] result in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-
-                    self.activityIndicator.stopAnimating()
-                    self.isExecuting = false
-
-                    switch result {
-                    case .success:
-                        // Terminal output already updated incrementally via streamHandler
-                        break
-                    case let .failure(error):
-                        self.appendToTerminal("\nError: \(error.localizedDescription)", isInput: false)
-                    }
-
-                    self.appendToTerminal("\n$ ", isInput: false)
-                    self.scrollToBottom()
-                }
+            return
+        } else if command.lowercased() == "help" {
+            // Show help
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.showHelp()
+                self.activityIndicator.stopAnimating()
+                self.isExecuting = false
             }
-        } else {
-            // Legacy HTTP-based execution without streaming
-            logger.log(message: "Executing command via HTTP: \(command)", type: .info)
+            return
+        } else if command.lowercased() == "history" {
+            // Show command history
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                
+                let historyList = self.history.getHistory().enumerated().map { index, cmd in
+                    return "  \(index + 1)  \(cmd)"
+                }.joined(separator: "\n")
+                
+                self.appendToTerminal("\n\(historyList)\n\n$ ", isInput: false)
+                self.scrollToBottom()
+                self.activityIndicator.stopAnimating()
+                self.isExecuting = false
+            }
+            return
+        }
 
-            TerminalService.shared.executeCommand(
-                command,
-                outputHandler: { _ in /* No streaming needed here */ },
-                completion: { [weak self] result in
-                    DispatchQueue.main.async {
-                        guard let self = self else { return }
+        // Create a stream handler to receive real-time updates
+        let streamHandler: (String) -> Void = { [weak self] outputChunk in
+            DispatchQueue.main.async {
+                guard let self = self, self.isExecuting else { return }
+                self.appendToTerminalStreaming(outputChunk)
+            }
+        }
 
-                        self.activityIndicator.stopAnimating()
-                        self.isExecuting = false
+        logger.log(message: "Executing command: \(command)", type: .info)
 
-                        switch result {
-                        case .success:
-                            // Success case doesn't return a String output
-                            self.appendToTerminal("Command executed successfully", isInput: false)
-                        case let .failure(error):
-                            self.appendToTerminal("Error: \(error.localizedDescription)", isInput: false)
-                        }
+        // Execute with on-device terminal service
+        terminalService.executeCommand(command, outputHandler: streamHandler) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
 
-                        self.appendToTerminal("\n$ ", isInput: false)
-                        self.scrollToBottom()
-                    }
+                self.activityIndicator.stopAnimating()
+                self.isExecuting = false
+
+                switch result {
+                case .success:
+                    // Terminal output already updated incrementally via streamHandler
+                    break
+                case let .failure(error):
+                    self.appendToTerminal("\nError: \(error.localizedDescription)", isInput: false)
                 }
-            )
+
+                self.appendToTerminal("\n$ ", isInput: false)
+                self.scrollToBottom()
+            }
         }
     }
 
@@ -624,33 +598,534 @@ class TerminalViewController: UIViewController {
         dismiss(animated: true)
     }
 
-    // MARK: - WebDAV File Access
+    // MARK: - File Manager Integration
+// MARK: - File Manager View Controller
 
-    /// Opens Files app with WebDAV connection to view terminal files
-    @objc private func viewFiles() {
-        // Show loading indicator
-        activityIndicator.startAnimating()
-
-        // Get WebDAV credentials for the current session
-        getWebDAVCredentials { [weak self] result in
-            guard let self = self else { return }
-
-            DispatchQueue.main.async {
-                self.activityIndicator.stopAnimating()
-
-                switch result {
-                case let .success(credentials):
-                    // Open Files app with WebDAV connection
-                    self.openWebDAVLocation(credentials: credentials)
-
-                case let .failure(error):
-                    // Show error alert
-                    self.showErrorAlert(title: "Failed to Access Files", message: error.localizedDescription)
-                    self.logger.log(message: "WebDAV access error: \(error.localizedDescription)", type: .error)
+class FileManagerViewController: UITableViewController {
+    // Directory being displayed
+    private var directory: URL
+    
+    // File items in the directory
+    private var items: [FileItem] = []
+    
+    // Delegate to notify of directory changes
+    weak var delegate: TerminalViewController?
+    
+    // Logger
+    private let logger = Debug.shared
+    
+    // Initialize with a directory
+    init(directory: URL) {
+        self.directory = directory
+        super.init(style: .grouped)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        // Set up the table view
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "FileCell")
+        
+        // Set up navigation bar
+        title = directory.lastPathComponent
+        
+        // Add create directory button
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .add,
+            target: self,
+            action: #selector(createNewItem)
+        )
+        
+        // Load directory contents
+        loadDirectoryContents()
+    }
+    
+    // Load the contents of the current directory
+    private func loadDirectoryContents() {
+        do {
+            // Get directory contents
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
+                options: []
+            )
+            
+            // Create file items
+            items = contents.map { FileItem(url: $0) }
+            
+            // Sort items: directories first, then alphabetically
+            items.sort { (item1, item2) -> Bool in
+                if item1.isDirectory && !item2.isDirectory {
+                    return true
+                } else if !item1.isDirectory && item2.isDirectory {
+                    return false
+                } else {
+                    return item1.name.localizedCaseInsensitiveCompare(item2.name) == .orderedAscending
                 }
             }
+            
+            // Reload table view
+            tableView.reloadData()
+        } catch {
+            logger.log(message: "Error loading directory contents: \(error.localizedDescription)", type: .error)
+            
+            // Show error alert
+            let alert = UIAlertController(
+                title: "Error",
+                message: "Could not load directory contents: \(error.localizedDescription)",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
         }
     }
+    
+    // MARK: - Table View Data Source
+    
+    override func numberOfSections(in tableView: UITableView) -> Int {
+        return 1
+    }
+    
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        return items.count
+    }
+    
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath)
+        let item = items[indexPath.row]
+        
+        // Configure cell
+        cell.textLabel?.text = item.name
+        
+        // Set icon based on file type
+        if item.isDirectory {
+            cell.imageView?.image = UIImage(systemName: "folder")
+            cell.accessoryType = .disclosureIndicator
+        } else {
+            // Choose icon based on file extension
+            let fileExtension = item.url.pathExtension.lowercased()
+            
+            switch fileExtension {
+            case "txt", "md", "rtf", "swift", "h", "m", "c", "cpp", "java", "js", "html", "css", "xml", "json", "plist":
+                cell.imageView?.image = UIImage(systemName: "doc.text")
+            case "jpg", "jpeg", "png", "gif", "tiff", "bmp", "heic":
+                cell.imageView?.image = UIImage(systemName: "photo")
+            case "mp4", "mov", "avi", "mkv":
+                cell.imageView?.image = UIImage(systemName: "film")
+            case "mp3", "wav", "aac", "m4a":
+                cell.imageView?.image = UIImage(systemName: "music.note")
+            case "pdf":
+                cell.imageView?.image = UIImage(systemName: "doc.fill")
+            case "zip", "rar", "tar", "gz", "7z":
+                cell.imageView?.image = UIImage(systemName: "archivebox")
+            default:
+                cell.imageView?.image = UIImage(systemName: "doc")
+            }
+            
+            cell.accessoryType = .none
+        }
+        
+        // Set tint color
+        cell.imageView?.tintColor = .systemBlue
+        
+        return cell
+    }
+    
+    // MARK: - Table View Delegate
+    
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        let item = items[indexPath.row]
+        
+        if item.isDirectory {
+            // Navigate to directory
+            let fileManager = FileManagerViewController(directory: item.url)
+            fileManager.delegate = delegate
+            navigationController?.pushViewController(fileManager, animated: true)
+        } else {
+            // Show file preview
+            previewFile(item)
+        }
+        
+        tableView.deselectRow(at: indexPath, animated: true)
+    }
+    
+    override func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        let item = items[indexPath.row]
+        
+        // Delete action
+        let deleteAction = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, completion in
+            guard let self = self else { return }
+            
+            // Confirm deletion
+            let alert = UIAlertController(
+                title: "Delete \(item.name)",
+                message: "Are you sure you want to delete this \(item.isDirectory ? "directory" : "file")?",
+                preferredStyle: .alert
+            )
+            
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                completion(false)
+            })
+            
+            alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { _ in
+                do {
+                    try FileManager.default.removeItem(at: item.url)
+                    self.items.remove(at: indexPath.row)
+                    tableView.deleteRows(at: [indexPath], with: .automatic)
+                    completion(true)
+                } catch {
+                    self.logger.log(message: "Error deleting item: \(error.localizedDescription)", type: .error)
+                    
+                    // Show error alert
+                    let errorAlert = UIAlertController(
+                        title: "Error",
+                        message: "Could not delete item: \(error.localizedDescription)",
+                        preferredStyle: .alert
+                    )
+                    errorAlert.addAction(UIAlertAction(title: "OK", style: .default))
+                    self.present(errorAlert, animated: true)
+                    
+                    completion(false)
+                }
+            })
+            
+            self.present(alert, animated: true)
+        }
+        
+        // Rename action
+        let renameAction = UIContextualAction(style: .normal, title: "Rename") { [weak self] _, _, completion in
+            guard let self = self else { return }
+            
+            // Show rename alert
+            let alert = UIAlertController(
+                title: "Rename \(item.name)",
+                message: "Enter a new name:",
+                preferredStyle: .alert
+            )
+            
+            alert.addTextField { textField in
+                textField.text = item.name
+                textField.clearButtonMode = .whileEditing
+                textField.autocapitalizationType = .none
+                textField.autocorrectionType = .no
+            }
+            
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                completion(false)
+            })
+            
+            alert.addAction(UIAlertAction(title: "Rename", style: .default) { _ in
+                guard let newName = alert.textFields?.first?.text, !newName.isEmpty else {
+                    completion(false)
+                    return
+                }
+                
+                let newURL = self.directory.appendingPathComponent(newName)
+                
+                do {
+                    try FileManager.default.moveItem(at: item.url, to: newURL)
+                    self.loadDirectoryContents()
+                    completion(true)
+                } catch {
+                    self.logger.log(message: "Error renaming item: \(error.localizedDescription)", type: .error)
+                    
+                    // Show error alert
+                    let errorAlert = UIAlertController(
+                        title: "Error",
+                        message: "Could not rename item: \(error.localizedDescription)",
+                        preferredStyle: .alert
+                    )
+                    errorAlert.addAction(UIAlertAction(title: "OK", style: .default))
+                    self.present(errorAlert, animated: true)
+                    
+                    completion(false)
+                }
+            })
+            
+            self.present(alert, animated: true)
+        }
+        
+        renameAction.backgroundColor = .systemBlue
+        
+        return UISwipeActionsConfiguration(actions: [deleteAction, renameAction])
+    }
+    
+    // MARK: - Actions
+    
+    @objc private func createNewItem() {
+        let alert = UIAlertController(
+            title: "Create New",
+            message: nil,
+            preferredStyle: .actionSheet
+        )
+        
+        alert.addAction(UIAlertAction(title: "Directory", style: .default) { [weak self] _ in
+            self?.createNewDirectory()
+        })
+        
+        alert.addAction(UIAlertAction(title: "Text File", style: .default) { [weak self] _ in
+            self?.createNewFile()
+        })
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        
+        // For iPad support
+        if let popoverController = alert.popoverPresentationController {
+            popoverController.barButtonItem = navigationItem.rightBarButtonItem
+        }
+        
+        present(alert, animated: true)
+    }
+    
+    private func createNewDirectory() {
+        let alert = UIAlertController(
+            title: "Create Directory",
+            message: "Enter a name for the new directory:",
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = "Directory Name"
+            textField.clearButtonMode = .whileEditing
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+        }
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: "Create", style: .default) { [weak self] _ in
+            guard let self = self, let name = alert.textFields?.first?.text, !name.isEmpty else { return }
+            
+            let newDirectoryURL = self.directory.appendingPathComponent(name)
+            
+            do {
+                try FileManager.default.createDirectory(
+                    at: newDirectoryURL,
+                    withIntermediateDirectories: false,
+                    attributes: nil
+                )
+                self.loadDirectoryContents()
+            } catch {
+                self.logger.log(message: "Error creating directory: \(error.localizedDescription)", type: .error)
+                
+                // Show error alert
+                let errorAlert = UIAlertController(
+                    title: "Error",
+                    message: "Could not create directory: \(error.localizedDescription)",
+                    preferredStyle: .alert
+                )
+                errorAlert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(errorAlert, animated: true)
+            }
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    private func createNewFile() {
+        let alert = UIAlertController(
+            title: "Create Text File",
+            message: "Enter a name for the new file:",
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = "File Name"
+            textField.clearButtonMode = .whileEditing
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+        }
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: "Create", style: .default) { [weak self] _ in
+            guard let self = self, let name = alert.textFields?.first?.text, !name.isEmpty else { return }
+            
+            let newFileURL = self.directory.appendingPathComponent(name)
+            
+            do {
+                try "".write(to: newFileURL, atomically: true, encoding: .utf8)
+                self.loadDirectoryContents()
+            } catch {
+                self.logger.log(message: "Error creating file: \(error.localizedDescription)", type: .error)
+                
+                // Show error alert
+                let errorAlert = UIAlertController(
+                    title: "Error",
+                    message: "Could not create file: \(error.localizedDescription)",
+                    preferredStyle: .alert
+                )
+                errorAlert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(errorAlert, animated: true)
+            }
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    // Preview a file
+    private func previewFile(_ item: FileItem) {
+        // Check if file is a text file
+        let fileExtension = item.url.pathExtension.lowercased()
+        let textFileExtensions = ["txt", "md", "rtf", "swift", "h", "m", "c", "cpp", "java", "js", "html", "css", "xml", "json", "plist"]
+        
+        if textFileExtensions.contains(fileExtension) || fileExtension.isEmpty {
+            // Show text editor
+            do {
+                let content = try String(contentsOf: item.url, encoding: .utf8)
+                showTextEditor(for: item.url, content: content)
+            } catch {
+                logger.log(message: "Error reading file: \(error.localizedDescription)", type: .error)
+                
+                // Show error alert
+                let alert = UIAlertController(
+                    title: "Error",
+                    message: "Could not read file: \(error.localizedDescription)",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                present(alert, animated: true)
+            }
+        } else {
+            // Use document interaction controller for other file types
+            let documentInteractionController = UIDocumentInteractionController(url: item.url)
+            documentInteractionController.delegate = self
+            documentInteractionController.presentPreview(animated: true)
+        }
+    }
+    
+    // Show text editor for a file
+    private func showTextEditor(for url: URL, content: String) {
+        let textEditor = TextEditorViewController(fileURL: url, content: content)
+        let navController = UINavigationController(rootViewController: textEditor)
+        present(navController, animated: true)
+    }
+    
+    // Set the current directory in the terminal
+    private func setTerminalDirectory() {
+        delegate?.terminalService.setCurrentWorkingDirectory(directory)
+        delegate?.appendToTerminal("\nChanged directory to: \(directory.path)\n$ ", isInput: false)
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        
+        // If we're going back, update the terminal's working directory
+        if isMovingFromParent {
+            setTerminalDirectory()
+        }
+    }
+}
+
+// MARK: - UIDocumentInteractionControllerDelegate
+
+extension FileManagerViewController: UIDocumentInteractionControllerDelegate {
+    func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
+        return self
+    }
+}
+
+// MARK: - Text Editor View Controller
+
+class TextEditorViewController: UIViewController {
+    private let textView = UITextView()
+    private let fileURL: URL
+    private var content: String
+    private let logger = Debug.shared
+    
+    init(fileURL: URL, content: String) {
+        self.fileURL = fileURL
+        self.content = content
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        // Set up the view
+        view.backgroundColor = .systemBackground
+        title = fileURL.lastPathComponent
+        
+        // Set up the text view
+        textView.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.text = content
+        textView.autocorrectionType = .no
+        textView.autocapitalizationType = .none
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(textView)
+        
+        // Set up constraints
+        NSLayoutConstraint.activate([
+            textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+        ])
+        
+        // Add save button
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .save,
+            target: self,
+            action: #selector(saveFile)
+        )
+        
+        // Add cancel button
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .cancel,
+            target: self,
+            action: #selector(cancel)
+        )
+    }
+    
+    @objc private func saveFile() {
+        do {
+            try textView.text.write(to: fileURL, atomically: true, encoding: .utf8)
+            logger.log(message: "File saved: \(fileURL.path)", type: .info)
+            dismiss(animated: true)
+        } catch {
+            logger.log(message: "Error saving file: \(error.localizedDescription)", type: .error)
+            
+            // Show error alert
+            let alert = UIAlertController(
+                title: "Error",
+                message: "Could not save file: \(error.localizedDescription)",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+        }
+    }
+    
+    @objc private func cancel() {
+        // Check if content has changed
+        if textView.text != content {
+            // Show confirmation alert
+            let alert = UIAlertController(
+                title: "Unsaved Changes",
+                message: "You have unsaved changes. Are you sure you want to discard them?",
+                preferredStyle: .alert
+            )
+            
+            alert.addAction(UIAlertAction(title: "Discard", style: .destructive) { [weak self] _ in
+                self?.dismiss(animated: true)
+            })
+            
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            
+            present(alert, animated: true)
+        } else {
+            dismiss(animated: true)
+        }
+    }
+}
 
     /// Fetches WebDAV credentials from the server
     private func getWebDAVCredentials(completion: @escaping (Result<WebDAVCredentials, Error>) -> Void) {

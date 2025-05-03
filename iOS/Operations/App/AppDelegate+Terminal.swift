@@ -8,9 +8,11 @@ extension AppDelegate {
             UserDefaults.standard.set(true, forKey: "show_terminal_button")
         }
 
-        // Remove any existing server settings (now hardcoded)
-        UserDefaults.standard.removeObject(forKey: "terminal_server_url")
-        UserDefaults.standard.removeObject(forKey: "terminal_api_key")
+        // Initialize the local terminal service
+        _ = LocalTerminalService.shared
+        
+        // Initialize the language interpreter
+        _ = LanguageInterpreter.shared
 
         // Register AI commands for terminal
         registerTerminalCommands()
